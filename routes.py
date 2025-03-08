@@ -2,7 +2,7 @@ import os
 import uuid
 from pathlib import Path
 from datetime import timedelta
-import magic
+# import magic
 from fastapi import Depends, HTTPException, status, APIRouter, UploadFile, File, Query
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
@@ -219,50 +219,50 @@ async def upload_protest_image(
             detail='No image file uploaded'
         )
 
-    file_contents = await file.read()
-    size = len(file_contents)
+    # file_contents = await file.read()
+    # size = len(file_contents)
 
-    if size > 5242880:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='File should not be more than 5MB in size'
-        )
+    # if size > 5242880:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         detail='File should not be more than 5MB in size'
+    #     )
 
-    file_type = magic.from_buffer(buffer=file_contents, mime=True)
-    if file_type not in SUPPORTED_FILES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='File type is not allowed. Supported types: jpeg, png, jpg'
-        )
+    # file_type = magic.from_buffer(buffer=file_contents, mime=True)
+    # if file_type not in SUPPORTED_FILES:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         detail='File type is not allowed. Supported types: jpeg, png, jpg'
+    #     )
 
-    file_name = f"protest_images/{protest_id}/{uuid.uuid4()}.{SUPPORTED_FILES[file_type]}"  # Store by protest ID
-    blob = bucket.blob(file_name)
-    blob.upload_from_string(file_contents, content_type=file_type)
+    # file_name = f"protest_images/{protest_id}/{uuid.uuid4()}.{SUPPORTED_FILES[file_type]}"  # Store by protest ID
+    # blob = bucket.blob(file_name)
+    # blob.upload_from_string(file_contents, content_type=file_type)
 
-    image_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{file_name}"
-
-
-    # Create ProtestImage record
-    new_protest_image = models.ProtestImage(
-        protest_id=protest_id,
-        image_url=image_url,
-        description=description,
-        submitted_by=user.id,
-        status="not_verified"  # Default status
-    )
-
-    db.add(new_protest_image)
-    db.commit()
-    db.refresh(new_protest_image)
+    # image_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{file_name}"
 
 
-    response = {
-        "message": "Protest image uploaded successfully",
-        "image_url": image_url,
-        "file_type": SUPPORTED_FILES[file_type],
-        "protest_image_id": new_protest_image.id  # Return the ID of the new record
-    }
-    return jsonable_encoder(response)
+    # # Create ProtestImage record
+    # new_protest_image = models.ProtestImage(
+    #     protest_id=protest_id,
+    #     image_url=image_url,
+    #     description=description,
+    #     submitted_by=user.id,
+    #     status="not_verified"  # Default status
+    # )
+
+    # db.add(new_protest_image)
+    # db.commit()
+    # db.refresh(new_protest_image)
+
+
+    # response = {
+    #     "message": "Protest image uploaded successfully",
+    #     "image_url": image_url,
+    #     "file_type": SUPPORTED_FILES[file_type],
+    #     "protest_image_id": new_protest_image.id  # Return the ID of the new record
+    # }
+    # return jsonable_encoder(response)
 
 
 @router.post("/direction_mapping", status_code=status.HTTP_201_CREATED, response_model=schemas.DirectionMapping)
@@ -373,6 +373,86 @@ async def get_protest_details(
         protest_list.append(protest_info)
 
     return protest_list
+
+@router.get("/protests/{protest_id}", response_model=None)  # Define a custom response model
+async def get_protest_by_id(
+    protest_id: int,
+    db: Session = Depends(get_db),
+    Authorize: AuthJWT = Depends()
+):
+    """
+    Retrieves detailed information about a specific protest, including its images (excluding flagged/misleading),
+    location, description, creation details, and the most prominent protest nature.  Requires authentication.
+    """
+    try:
+        Authorize.jwt_required()  # Require authentication
+        current_user_email = Authorize.get_jwt_subject()
+        user = db.query(models.User).filter(models.User.email == current_user_email).first()
+        if user is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    except AuthJWTException as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))  # Propagate JWT auth errors
+
+    # Retrieve the protest
+    protest = db.query(models.Protest).filter(models.Protest.id == protest_id).first()
+    if not protest:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Protest not found")
+
+    # Retrieve protest images, excluding flagged and misleading ones
+    images = db.query(models.ProtestImage).filter(
+        models.ProtestImage.protest_id == protest_id,
+        models.ProtestImage.status.notin_(["flagged", "misleading"])
+    ).all()
+
+    # Prepare the image data
+    image_data = []
+    for image in images:
+        image_data.append({
+            "id": image.id,
+            "image_url": image.image_url,
+            "description": image.description,
+            "submitted_by": image.submitted_by,
+            "status": image.status.value,  # Access ChoiceType value,
+            "created_at": image.created_at
+        })
+
+    # Get the last 5 protest nature reports for the protest
+    last_nature_reports = db.query(models.ProtestNature).filter(
+        models.ProtestNature.protest_id == protest_id
+    ).order_by(models.ProtestNature.created_at.desc()).limit(5).all()
+
+    # Determine the most prominent nature
+    if last_nature_reports:
+        nature_counts = {}
+        for report in last_nature_reports:
+            nature = report.nature.value # Access ChoiceType value
+            nature_counts[nature] = nature_counts.get(nature, 0) + 1
+
+        most_prominent_nature = max(nature_counts, key=nature_counts.get)
+    else:
+        most_prominent_nature = None
+
+    # Construct the response
+    protest_info = {
+        "id": protest.id,
+        "longitude": protest.longitude,
+        "latitude": protest.latitude,
+        "title": protest.title,
+        "course": protest.course,
+        "explanation": protest.explanation,
+        "date": protest.date.isoformat(),  # Convert date to string format
+        "starting_time": protest.starting_time.isoformat() if protest.starting_time else None,  # Convert time to string format
+        "ending_time": protest.ending_time.isoformat() if protest.ending_time else None, # Convert time to string format
+        "county": protest.county,
+        "subcounty": protest.subcounty,
+        "location_name": protest.location_name,
+        "created_at": protest.created_at,
+        "images": image_data,
+        "nature": most_prominent_nature
+    }
+
+    return protest_info
 
 @router.get("/protests/search", response_model=None)
 async def search_protests(

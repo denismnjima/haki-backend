@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, constr
+from pydantic import BaseModel, constr
 from datetime import date, time, datetime
 from typing import Optional, List
 from enum import Enum as PyEnum
@@ -30,7 +30,7 @@ class ProtestNatureType(str, PyEnum):
 
 
 class UserBase(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 class UserCreate(UserBase):
@@ -50,7 +50,7 @@ class UserSignUp(UserBase):
     type: Optional[str] = 'REGISTERED'
     trust_level: Optional[int] = 1
     status: Optional[str] = 'OKAY'
-    email: EmailStr
+    email: str
     password: str
 
     class Config:
