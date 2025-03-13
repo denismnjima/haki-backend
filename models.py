@@ -79,6 +79,7 @@ class DirectionMapping(Base):
     latitude = Column(Float)
     user_id = Column(Integer, ForeignKey("users.id"))
     date = Column(Date)
+    protest_id = Column(Integer, ForeignKey("protests.id"))
     time = Column(Time)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

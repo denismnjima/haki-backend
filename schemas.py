@@ -108,6 +108,7 @@ class DirectionMappingBase(BaseModel):
     latitude: float
     date: date
     time: time
+    protest_id: int
 
 class DirectionMappingCreate(DirectionMappingBase):
     pass

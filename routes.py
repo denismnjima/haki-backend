@@ -2,7 +2,7 @@ import os
 import uuid
 from pathlib import Path
 from datetime import timedelta
-# import magic
+import magic
 from fastapi import Depends, HTTPException, status, APIRouter, UploadFile, File, Query
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
@@ -14,12 +14,14 @@ import schemas
 import database
 from database import get_db
 from fastapi_jwt_auth import AuthJWT
-from fastapi_jwt_auth.exceptions import AuthJWTException
+from fastapi_jwt_auth.exceptions import AuthJWTException,MissingTokenError
 from werkzeug.security import generate_password_hash, check_password_hash
 from typing import Optional
 from datetime import date
 from datetime import date as dt_date, datetime
-
+from b2sdk.v2 import InMemoryAccountInfo, B2Api
+import humanize
+from typing import List
 from google.cloud import storage
 
 router = APIRouter(
@@ -27,20 +29,72 @@ router = APIRouter(
     tags=['Authentication', 'Protests', 'Protest Nature', 'Protest Images', 'Direction Mapping']
 )
 
-# GCS Configuration
-GCS_CREDENTIALS_PATH = Path(__file__).resolve().parent / 'service.json'  # Adjusted for relative path
-GCS_BUCKET_NAME = 'property_images_pa254'  # Replace with your bucket name
+
 SUPPORTED_FILES = {
     'image/jpeg': 'jpeg',
     'image/png': 'png',
     'image/jpg': 'jpg'
 }
+key_id = os.getenv('KEY_ID')
+application_key = os.getenv('APPLICATION_KEY')
+info = InMemoryAccountInfo()
 
-if not os.path.exists(GCS_CREDENTIALS_PATH):
-    raise FileNotFoundError("GCS Credential File not found!")
+b2_api = B2Api(info)
+b2_api.authorize_account("production", key_id,application_key)
+bucket = b2_api.get_bucket_by_name('property-app')
 
-storage_client = storage.Client.from_service_account_json(GCS_CREDENTIALS_PATH)
-bucket = storage_client.bucket(GCS_BUCKET_NAME)
+@router.post('/upload_image',status_code=status.HTTP_201_CREATED)
+async def upload_profile_img(prtest_id: int,description: str,file:UploadFile=File(...),Authorize: AuthJWT=Depends(),db: Session = Depends(get_db)):
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail= ' No image file uploaded'
+        )
+    
+    file_contents = await file.read()
+    size = len(file_contents)
+
+    if size>5242880:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='File should not be larger than 5mb'
+        )
+    
+    file_type = magic.from_buffer(buffer=file_contents, mime=True)
+
+    if file_type not in SUPPORTED_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='File type is not allowed'
+        )
+    
+    try:
+        file_name =f"{uuid.uuid4()}.{SUPPORTED_FILES[file_type]}"
+        upload_image = bucket.upload_bytes(file_contents,file_name)
+        image_url = bucket.get_download_url(file_name)
+        #submit image
+        new_image = models.ProtestImage(
+            image_url=image_url,
+            description=description,
+            protest_id=prtest_id
+        )
+        
+        db.add(new_image)
+        db.commit()
+
+        response = {
+            "message": "file successfully",
+            "image_url": image_url
+        }
+
+        return jsonable_encoder(response)
+    
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=status.HTTP_408_REQUEST_TIMEOUT,
+            detail= f"Image upload failed: {e}"
+        )
 
 
 @router.post('/refresh')
@@ -57,26 +111,6 @@ def refresh(Authorize: AuthJWT = Depends()):
     new_access_token = Authorize.create_access_token(subject=current_user)
     return {"access_token": new_access_token}
 
-
-@router.post('/login')
-def login(login:schemas.UserBase,db: Session = Depends(get_db), Authorize: AuthJWT = Depends()):
-    user = db.query(models.User).filter(models.User.email == login.email).first()
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"Invalid Credentials")
-    if not check_password_hash(user.password, login.password):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"Incorrect password")
-    
-    access_token = Authorize.create_access_token(subject=user.email)
-    refresh_token = Authorize.create_refresh_token(subject=user.email)
-    response =  {
-             "sucess": True,
-             "access_token": access_token,
-             "refresh_token":refresh_token,
-             "email":user.email,
-            }
-    return response
 
 
 
@@ -144,7 +178,10 @@ async def create_protest_nature(protest_nature: schemas.ProtestNatureCreate, pro
     """
     Submits the nature of a protest by a user. Requires a valid JWT token.  Prevents duplicate submissions within 5 minutes.
     """
-    Authorize.jwt_required()
+    try:
+        Authorize.jwt_required()
+    except MissingTokenError:
+        raise HTTPException(status_code=401, detail="Missing JWT token")
     current_user_email = Authorize.get_jwt_subject()
     user = db.query(models.User).filter(models.User.email == current_user_email).first()
     if user is None:
@@ -182,94 +219,9 @@ async def create_protest_nature(protest_nature: schemas.ProtestNatureCreate, pro
     db.refresh(new_protest_nature)
     return new_protest_nature
 
-@router.post("/protest_images", status_code=status.HTTP_201_CREATED)
-async def upload_protest_image(
-    protest_id: int,
-    file: UploadFile = File(...),
-    description: str = "",  # Optional description
-    Authorize: AuthJWT = Depends(),
-    db: Session = Depends(get_db)
-):
-    """
-    Uploads an image related to a specific protest.
-    """
-    try:
-        Authorize.jwt_required()
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token"
-        )
-
-    current_user_email = Authorize.get_jwt_subject()
-    user = db.query(models.User).filter(models.User.email == current_user_email).first()
-
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    # Verify that the protest exists
-    protest = db.query(models.Protest).filter(models.Protest.id == protest_id).first()
-    if protest is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Protest not found")
-
-
-    if not file:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail='No image file uploaded'
-        )
-
-    # file_contents = await file.read()
-    # size = len(file_contents)
-
-    # if size > 5242880:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_400_BAD_REQUEST,
-    #         detail='File should not be more than 5MB in size'
-    #     )
-
-    # file_type = magic.from_buffer(buffer=file_contents, mime=True)
-    # if file_type not in SUPPORTED_FILES:
-    #     raise HTTPException(
-    #         status_code=status.HTTP_400_BAD_REQUEST,
-    #         detail='File type is not allowed. Supported types: jpeg, png, jpg'
-    #     )
-
-    # file_name = f"protest_images/{protest_id}/{uuid.uuid4()}.{SUPPORTED_FILES[file_type]}"  # Store by protest ID
-    # blob = bucket.blob(file_name)
-    # blob.upload_from_string(file_contents, content_type=file_type)
-
-    # image_url = f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/{file_name}"
-
-
-    # # Create ProtestImage record
-    # new_protest_image = models.ProtestImage(
-    #     protest_id=protest_id,
-    #     image_url=image_url,
-    #     description=description,
-    #     submitted_by=user.id,
-    #     status="not_verified"  # Default status
-    # )
-
-    # db.add(new_protest_image)
-    # db.commit()
-    # db.refresh(new_protest_image)
-
-
-    # response = {
-    #     "message": "Protest image uploaded successfully",
-    #     "image_url": image_url,
-    #     "file_type": SUPPORTED_FILES[file_type],
-    #     "protest_image_id": new_protest_image.id  # Return the ID of the new record
-    # }
-    # return jsonable_encoder(response)
-
 
 @router.post("/direction_mapping", status_code=status.HTTP_201_CREATED, response_model=schemas.DirectionMapping)
 async def create_direction_mapping(direction_mapping: schemas.DirectionMappingCreate, db: Session = Depends(get_db), Authorize: AuthJWT = Depends()):
-    """
-    Submits direction mapping data by a user. Requires a valid JWT token.
-    """
     Authorize.jwt_required()
     current_user_email = Authorize.get_jwt_subject()
     user = db.query(models.User).filter(models.User.email == current_user_email).first()
@@ -279,9 +231,10 @@ async def create_direction_mapping(direction_mapping: schemas.DirectionMappingCr
     new_direction_mapping = models.DirectionMapping(
         longitude=direction_mapping.longitude,
         latitude=direction_mapping.latitude,
-        user_id=user.id,  # Associate the mapping with the logged-in user
+        user_id=user.id,
         date=direction_mapping.date,
-        time=direction_mapping.time
+        time=direction_mapping.time,
+        protest_id = direction_mapping.protest_id,
     )
 
     db.add(new_direction_mapping)
@@ -289,8 +242,19 @@ async def create_direction_mapping(direction_mapping: schemas.DirectionMappingCr
     db.refresh(new_direction_mapping)
     return new_direction_mapping
 
+@router.get("/direction_mapping", response_model=List[schemas.DirectionMapping])
+async def get_direction_mappings_by_protest(
+    protest_id: int = Query(..., description="The ID of the protest to retrieve direction mappings for."),
+    db: Session = Depends(get_db)
+):
+    """
+    Retrieves all direction mappings for a given protest ID.  Requires a valid JWT token.
+    """
 
-@router.get("/protests", response_model=None)  # Define a custom response model
+    direction_mappings = db.query(models.DirectionMapping).filter(models.DirectionMapping.protest_id == protest_id).all()
+    return direction_mappings
+
+@router.get("/protests", response_model=None) 
 async def get_protest_details(
     date: Optional[date] = Query(None, description="Filter protests by specific date (YYYY-MM-DD). If not provided, returns protests for the current date."),
     db: Session = Depends(get_db),
@@ -298,7 +262,7 @@ async def get_protest_details(
 ):
 
     try:
-        Authorize.get_jwt_subject()  # Try to get the user email. If no token, it will fail
+        Authorize.get_jwt_subject() 
         current_user_email = Authorize.get_jwt_subject()
         user = db.query(models.User).filter(models.User.email == current_user_email).first()
 
@@ -384,15 +348,7 @@ async def get_protest_by_id(
     Retrieves detailed information about a specific protest, including its images (excluding flagged/misleading),
     location, description, creation details, and the most prominent protest nature.  Requires authentication.
     """
-    try:
-        Authorize.jwt_required()  # Require authentication
-        current_user_email = Authorize.get_jwt_subject()
-        user = db.query(models.User).filter(models.User.email == current_user_email).first()
-        if user is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    except AuthJWTException as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))  # Propagate JWT auth errors
 
     # Retrieve the protest
     protest = db.query(models.Protest).filter(models.Protest.id == protest_id).first()
@@ -542,3 +498,56 @@ async def search_protests(
         protest_list.append(protest_info)
 
     return protest_list
+
+
+@router.get("/protest_images")
+async def get_protest_images(
+    protest_id: int = Query(..., description="The ID of the protest to retrieve images for."),
+    db: Session = Depends(get_db)
+):
+    """
+    Retrieves a list of protest images for a given protest ID, filtering by status.
+    Returns image details including description, status, and a human-readable "time ago" for creation date.
+    """
+
+    allowed_statuses = ["approved", "verified", "not_verified", "flagged"]
+
+    images = db.query(models.ProtestImage).filter(
+        models.ProtestImage.protest_id == protest_id,
+        models.ProtestImage.status.in_([models.PROTEST_IMAGE_STATUS_CHOICES[i][0] for i in range(len(models.PROTEST_IMAGE_STATUS_CHOICES)) if models.PROTEST_IMAGE_STATUS_CHOICES[i][0] in allowed_statuses])
+    ).all()
+
+    if not images:
+        return []  
+
+    image_list = []
+    for image in images:
+        image_list.append({
+            "id": image.id,
+            "image_url": image.image_url,
+            "description": image.description,
+            "status": image.status.value,
+            "created_at": humanize.naturaltime(image.created_at) 
+        })
+    return image_list
+
+
+@router.post('/login')
+def login(login:schemas.UserBase,db: Session = Depends(get_db), Authorize: AuthJWT = Depends()):
+    user = db.query(models.User).filter(models.User.email == login.email).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Invalid Credentials")
+    if not check_password_hash(user.password, login.password):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Incorrect password")
+    
+    access_token = Authorize.create_access_token(subject=user.email)
+    refresh_token = Authorize.create_refresh_token(subject=user.email)
+    response =  {
+             "sucess": True,
+             "access_token": access_token,
+             "refresh_token":refresh_token,
+             "email":user.email,
+            }
+    return response
