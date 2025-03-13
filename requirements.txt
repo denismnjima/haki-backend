@@ -29,6 +29,7 @@ grpcio==1.70.0
 grpcio-status==1.63.0rc1
 gunicorn==23.0.0
 h11==0.14.0
+humanize==4.10.0
 idna==3.10
 importlib_metadata==8.5.0
 importlib_resources==6.4.5
